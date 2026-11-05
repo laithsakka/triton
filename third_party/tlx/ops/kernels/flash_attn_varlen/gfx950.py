@@ -251,8 +251,21 @@ def _fold_partials(Part, slot0, count, m_i, l_i, acc0, acc1, acc2, acc3, BLOCK_M
 def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, stride_qh, stride_kt, stride_kh, stride_vt,
                            stride_vh, stride_ot, stride_oh, qk_scale, H, kv_group, num_m_blocks, items_per_bh, n_items,
                            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
-                           IS_CAUSAL: tl.constexpr, SPLIT: tl.constexpr):
+                           IS_CAUSAL: tl.constexpr, SPLIT: tl.constexpr, USE_I64_Q_OFFSETS: tl.constexpr = False,
+                           USE_I64_KV_OFFSETS: tl.constexpr = False, USE_I64_O_OFFSETS: tl.constexpr = False):
     tl.static_assert(HEAD_DIM == 128)
+    # The launcher sets these when a tensor's element offsets reach 2**31, where int32 offsets wrap.
+    if USE_I64_Q_OFFSETS:
+        stride_qt = tl.cast(stride_qt, tl.int64)
+        stride_qh = tl.cast(stride_qh, tl.int64)
+    if USE_I64_KV_OFFSETS:
+        stride_kt = tl.cast(stride_kt, tl.int64)
+        stride_kh = tl.cast(stride_kh, tl.int64)
+        stride_vt = tl.cast(stride_vt, tl.int64)
+        stride_vh = tl.cast(stride_vh, tl.int64)
+    if USE_I64_O_OFFSETS:
+        stride_ot = tl.cast(stride_ot, tl.int64)
+        stride_oh = tl.cast(stride_oh, tl.int64)
     pid = tl.program_id(0)
     # Workgroups go round-robin to the 8 XCDs: give each XCD a contiguous run
     # of (sequence, head, query tile[, split]) items.
@@ -418,6 +431,17 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
         tl.store(o_ptrs + 96, tlx.release_layout((acc3 * inv).to(out_ty)), mask=row_ok[:, None])
 
 
+def _needs_i64_offsets(t, block):
+    """Whether an element offset the kernel forms into the ``(tokens, heads, 128)`` tensor ``t`` can reach 2**31.
+
+    The kernel addresses whole ``block``-row tiles, so the masked rows of a sequence's last tile, up to
+    ``block - 1`` past the last token, count, and it forms the K/V block step ``block * stride(0)`` even for a
+    single token.
+    """
+    rows = max(t.shape[0], 2) + block - 1
+    return (rows - 1) * t.stride(0) + (t.shape[1] - 1) * t.stride(1) + t.shape[2] - 1 >= 1 << 31
+
+
 def _run_length(n_items, max_splits):
     # Items per XCD; a run that ends inside a tile extends to the tile's end.
     return triton.cdiv(n_items, 8) + max_splits - 1
@@ -492,5 +516,8 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
                                  k.stride(0), k.stride(1), v.stride(0), v.stride(1), out.stride(0), out.stride(1),
                                  sm_scale * 1.4426950408889634, heads, heads // k.shape[1], num_m_blocks, items_per_bh,
                                  n_items, BLOCK_M=BLOCK_M, BLOCK_N=block_n, HEAD_DIM=head_dim, IS_CAUSAL=causal,
-                                 SPLIT=split, num_warps=NUM_WARPS, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1)
+                                 SPLIT=split, USE_I64_Q_OFFSETS=_needs_i64_offsets(q, BLOCK_M),
+                                 USE_I64_KV_OFFSETS=_needs_i64_offsets(k, block_n) or _needs_i64_offsets(v, block_n),
+                                 USE_I64_O_OFFSETS=_needs_i64_offsets(out, BLOCK_M), num_warps=NUM_WARPS,
+                                 waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1)
     return out
